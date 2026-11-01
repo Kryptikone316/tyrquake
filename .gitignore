@@ -1,3 +1,5 @@
 *.o
 *.a
 *.so
+/sf3500/quakeloader/quakeloader.mipsel
+/sf3500/quakeloader/quakeloader_preview

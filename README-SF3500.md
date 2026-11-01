@@ -12,6 +12,8 @@ This branch adds what the SF3500 needs on top of `libretro/tyrquake`.
 | Opt-in log, crash dump | Messages go to a 64 KB in-memory ring; on a Quake error, a repaired string reference or a fatal signal it is written to `/mnt/sdcard/tyrquake_crash.log`. Create `/mnt/sdcard/tyrquake_debug.txt` to stream everything to `/mnt/sdcard/tyrquake.log`. A once-a-second `perf:` line shows runs/s, time in the core, audio and repairs. |
 | Test hooks | `TYR_CMD="map e1m1"` runs a console command on the first frame, `TYR_LOG=<file>` streams the log; used by an off-device libretro test host. |
 
+`sf3500/quakeloader/` is the small gamepad loader the port runs first: it lists the game folders that hold a `pak0.pak` (Quake, the mission packs, mods) and saves the choice in `game.txt`. It reuses the display, input and font modules of the other SF3500 ports; `make preview` builds a PC version with scripted input for screenshots.
+
 Content must be a `.pak` (the loader's convention): `id1/pak0.pak`, a mission pack's `pak0.pak`, or a mod
 packed into `pak0.pak` (the mod folder name is the game directory).
 
