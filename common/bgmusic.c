@@ -336,7 +336,11 @@ void BGM_PlayCDtrack (byte track, qboolean looping)
 		bgmstream = S_CodecOpenStreamType(tmp, type);
 		if (! bgmstream)
 			Con_Printf("Couldn't handle music file %s\n", tmp);
+		else
+			Dbg_Log("bgm: track %d playing from %s", (int)track, tmp);
 	}
+	else
+		Dbg_Log("bgm: track %d has no music file under %s/", (int)track, MUSIC_DIRNAME);
 }
 
 void BGM_Stop (void)

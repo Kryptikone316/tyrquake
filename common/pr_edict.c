@@ -1040,6 +1040,8 @@ PR_LoadProgs(void)
    pr_strings_size = progs->strings_size;
    if (progs->ofs_strings + pr_strings_size >= com_filesize)
       Host_Error("progs.dat strings extend past end of file\n");
+   Dbg_Log("progs.dat loaded: size=%d crc=%d strings=%d statements=%d globals=%d",
+	   com_filesize, pr_crc, pr_strings_size, progs->numstatements, progs->numglobals);
 
    /* Bounds-check every (ofs, num) pair in the progs.dat header
     * against com_filesize.  Without this, a crafted progs.dat with

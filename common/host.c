@@ -156,6 +156,7 @@ Host_Error(const char *error, ...)
     vsnprintf(string, sizeof(string), error, argptr);
     va_end(argptr);
     Con_Printf("%s: %s\n", __func__, string);
+    Dbg_DumpCrashLog(string);
 
     if (sv.active)
 	Host_ShutdownServer(false);

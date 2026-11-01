@@ -354,6 +354,8 @@ PR_LeaveFunction(void)
 PR_ExecuteProgram
 ====================
 */
+int Dbg_StringOK(int);
+
 void
 PR_ExecuteProgram(func_t fnum)
 {
@@ -725,6 +727,15 @@ PR_InitStringTable(void)
     num_prstr = 0;
 }
 
+unsigned dbg_string_repairs;
+
+int
+Dbg_StringOK(int num)
+{
+    return (num >= 0 && num < pr_strings_size - 1) || (num < 0 && num >= -num_prstr);
+}
+
+
 const char *
 PR_GetString(int num)
 {
@@ -746,9 +757,28 @@ PR_GetString(int num)
 	if (!s)
 	    s = "";
     }
-    else
+    else if (num < 0 && (num | 0x20000000) < 0 && (num | 0x20000000) >= -num_prstr
+	     && pr_strtbl[-(num | 0x20000000) - 1]) {
+	/* SF3500: on the real device a string reference in an entity field sometimes
+	 * comes back with bit 29 cleared (0xFFFFFF79 -> 0xDFFFFF79); cause not found yet
+	 * (QEMU and x86 never do it).  The correct value is the same number with the bit
+	 * set again, so use that and count it. */
+	extern unsigned dbg_string_repairs;
+	if (dbg_string_repairs++ < 20)
+	    Dbg_Log("PR_GetString: repaired string reference 0x%08x -> 0x%08x (repair #%u, func %s stmt %d)",
+		    (unsigned)num, (unsigned)(num | 0x20000000), dbg_string_repairs,
+		    pr_xfunction ? pr_strings + pr_xfunction->s_name : "?", pr_xstatement);
+	if (dbg_string_repairs == 1)
+	    Dbg_DumpCrashLog("repaired a string reference (first time)");
+	s = pr_strtbl[-(num | 0x20000000) - 1];
+    }
+    else {
+	Dbg_Log("PR_GetString bad offset %d: strings_size=%d num_prstr=%d func=%s stmt=%d depth=%d",
+		num, pr_strings_size, num_prstr,
+		pr_xfunction ? pr_strings + pr_xfunction->s_name : "?", pr_xstatement, pr_depth);
 	Host_Error("%s: invalid string offset %d (%d to %d valid)\n",
 		 __func__, num, -num_prstr, pr_strings_size - 2);
+    }
 
     return s;
 }

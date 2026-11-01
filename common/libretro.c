@@ -35,6 +35,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <xtl.h>
 #endif
 #include <stdlib.h>
+#include <math.h>
 #include <ctype.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,10 +44,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <direct.h>
 #else
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
 #include "cmd.h"
+#include "console.h"
+#include "server.h"
 #include "common.h"
 #include "quakedef.h"
 #include "d_local.h"
@@ -427,6 +432,16 @@ void Sys_Error(const char *error, ...)
    if (log_cb)
       log_cb(RETRO_LOG_ERROR, "%s\n", buffer);
    va_end(ap);
+   {
+      static int dumped;
+      Dbg_Log("Sys_Error: %s", buffer);
+      /* "Bad surface extents" is a harmless warning some maps trigger; not worth a crash log */
+      if (!dumped && strncmp(buffer, "Bad surface extents", 19) != 0)
+      {
+         dumped = 1;
+         Dbg_DumpCrashLog(buffer);
+      }
+   }
 
    /* Historical behaviour: log and return.  An earlier
     * round added a longjmp-out via sys_abort to give
@@ -511,6 +526,29 @@ static void gp_layout_set_bind(gp_layout_t gp_layout)
 }
 
 
+/* The layout the frontend asked for.  retro_set_controller_port_device() is usually
+ * called before retro_load_game(), when the console commands do not exist yet, so
+ * the binds are re-applied (to keys that are still unbound) once Host_Init is done. */
+int Key_StringToKeynum(const char *str);
+static const gp_layout_t *chosen_layout = &classic;
+
+/* Bind every key of the layout that has no binding yet.  Keys the player has bound
+ * (or that a mod's config.cfg set) are left alone. */
+static void gp_layout_fill_unbound(const gp_layout_t *gp_layout)
+{
+   unsigned i;
+   char buf[100];
+   for (i = 0; gp_layout->bind[i].key; ++i)
+   {
+      int k = Key_StringToKeynum(gp_layout->bind[i].key);
+      if (k < 0 || (keybindings[k] && keybindings[k][0]))
+         continue;
+      snprintf(buf, sizeof(buf), "bind %s \"%s\"", gp_layout->bind[i].key,
+                                                   gp_layout->bind[i].com);
+      Cmd_ExecuteString(buf, src_command);
+   }
+}
+
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
    if (port == 0)
@@ -520,16 +558,19 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
          case RETRO_DEVICE_JOYPAD:
             quake_devices[port] = RETRO_DEVICE_JOYPAD;
             environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, classic.desc);
+            chosen_layout = &classic;
             gp_layout_set_bind(classic);
             break;
          case RETRO_DEVICE_JOYPAD_ALT:
             quake_devices[port] = RETRO_DEVICE_JOYPAD;
             environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, classic_alt.desc);
+            chosen_layout = &classic_alt;
             gp_layout_set_bind(classic_alt);
             break;
          case RETRO_DEVICE_MODERN:
             quake_devices[port] = RETRO_DEVICE_MODERN;
             environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, modern.desc);
+            chosen_layout = &modern;
             gp_layout_set_bind(modern);
             break;
          case RETRO_DEVICE_KEYBOARD:
@@ -1142,13 +1183,51 @@ static void audio_step(void);
  * suppresses the dupe-last-frame path below in retro_run. */
 bool did_flip;
 
+/* SF3500: once a second, write how the game is running to the log:
+ * runs per second, time spent inside retro_run, the worst single run, audio pushed. */
+static struct { double t0, busy, worst; int runs; long audio; } fstats;
+static double mono_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static void frame_stats(double begin)
+{
+   double end = mono_now(), d = end - begin;
+   if (fstats.t0 == 0) fstats.t0 = begin;
+   fstats.busy += d;
+   if (d > fstats.worst) fstats.worst = d;
+   fstats.runs++;
+   if (end - fstats.t0 >= 1.0)
+   {
+      extern unsigned dbg_string_repairs;
+      Dbg_Log("perf: %d runs/s, %.1f ms avg in core (%.0f%% busy), worst %.0f ms, audio %ld/s, map %s, repairs %u",
+              fstats.runs, fstats.busy * 1000 / fstats.runs, fstats.busy * 100 / (end - fstats.t0),
+              fstats.worst * 1000, fstats.audio, sv.active ? sv.name : "-", dbg_string_repairs);
+      fstats.t0 = end; fstats.busy = fstats.worst = 0; fstats.runs = 0; fstats.audio = 0;
+   }
+}
+
 void retro_run(void)
 {
    bool updated = false;
+   double frame_begin = mono_now();
 
    perf_timing_section_begin(PERF_SECTION_FRAME);
 
    did_flip = false;
+
+   /* SF3500 debug: TYR_CMD="map e1m1" runs a console command on the first frame */
+   {
+      static int dbg_done;
+      const char *dbg = getenv("TYR_CMD");
+      if (dbg && !dbg_done)
+      {
+         dbg_done = 1;
+         Cbuf_AddText("%s\n", dbg);
+      }
+   }
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       update_variables(false);
@@ -1222,6 +1301,7 @@ void retro_run(void)
 
    perf_timing_section_end(PERF_SECTION_FRAME);
    perf_timing_end_frame();
+   frame_stats(frame_begin);
 }
 
 static void extract_directory(char *out_dir, const char *in_dir, size_t size)
@@ -1352,9 +1432,33 @@ bool retro_load_game(const struct retro_game_info *info)
                 free_mb, MEMSIZE_MB);
       }
       else
+      {
+         /* Frontends such as picoarch cannot answer the query: size the hunk from the
+          * kernel's own figure instead (half of what is available, 32..96 MB), so
+          * larger mods and mission packs have room.  TYR_HUNK_MB overrides, for tests. */
+         char line[128];
+         unsigned avail_mb = 0;
+         const char *ov = getenv("TYR_HUNK_MB");
+         FILE *mi = fopen("/proc/meminfo", "r");
+         while (mi && fgets(line, sizeof(line), mi))
+            if (!strncmp(line, "MemAvailable:", 13))
+               avail_mb = (unsigned)(strtoul(line + 13, NULL, 10) / 1024);
+         if (mi)
+            fclose(mi);
+         if (avail_mb)
+         {
+            unsigned budget = avail_mb >> 1;
+            if (budget > 96)
+               budget = 96;
+            if (budget > MEMSIZE_MB)
+               MEMSIZE_MB = budget;
+         }
+         if (ov && atoi(ov) > 0)
+            MEMSIZE_MB = (unsigned)atoi(ov);
          log_cb(RETRO_LOG_INFO,
-                "Frontend has no memory-status query; using default %u MB hunk.\n",
-                MEMSIZE_MB);
+                "Frontend has no memory-status query; hunk %u MB (kernel reports %u MB available).\n",
+                MEMSIZE_MB, avail_mb);
+      }
    }
 
    parms.memsize = MEMSIZE_MB * 1024 * 1024;
@@ -1403,6 +1507,20 @@ bool retro_load_game(const struct retro_game_info *info)
    heap = (unsigned char*)malloc(parms.memsize);
 
    parms.membase = heap;
+   Dbg_InstallCrashHandlers();
+   {
+      char line[128];
+      FILE *mi;
+      Dbg_Log("TyrQuake %s hunk=%u MB heap=%p sizeof(int/long/ptr)=%d/%d/%d",
+              stringify(TYR_VERSION), (unsigned)(parms.memsize >> 20), (void *)heap,
+              (int)sizeof(int), (int)sizeof(long), (int)sizeof(void *));
+      mi = fopen("/proc/meminfo", "r");
+      while (mi && fgets(line, sizeof(line), mi))
+         if (!strncmp(line, "MemTotal", 8) || !strncmp(line, "MemFree", 7) || !strncmp(line, "MemAvail", 8))
+         { line[strcspn(line, "\n")] = 0; Dbg_Log("%s", line); }
+      if (mi) fclose(mi);
+      Dbg_Log("rom path: %s", g_rom_dir);
+   }
 
    if (log_cb)
       log_cb(RETRO_LOG_INFO, "Quake Libretro -- TyrQuake Version %s\n", stringify(TYR_VERSION));
@@ -1454,6 +1572,11 @@ bool retro_load_game(const struct retro_game_info *info)
    Cmd_ExecuteString("bind AUX6 \"+left\"", src_command);
    Cmd_ExecuteString("bind AUX7 \"+lookup\"", src_command);
    Cmd_ExecuteString("bind AUX8 \"+lookdown\"", src_command);
+
+   /* Joypad binds for games that have no config.cfg yet (every mission pack on its
+    * first run); without this every button says "unbound, hit F4 to set". */
+   if (quake_devices[0] != RETRO_DEVICE_KEYBOARD)
+      gp_layout_fill_unbound(chosen_layout);
 
    /* Stand up the renderer backend selected by the
     * 'tyrquake_renderer' core option.  Must run after
@@ -1927,6 +2050,31 @@ static void audio_step(void)
     * tail of S_Update writes exactly samples_per_
     * frame stereo frames into shm->buffer ==
     * audio_out_buffer. */
+   /* SF3500: mix as much audio as real time has passed, not a fixed 1/framerate.
+    * When the game runs slower than its nominal rate (about 30 fps against 60) a
+    * fixed amount starves the frontend and the sound stutters. */
+   {
+      static struct timespec last_ts;
+      static double carry;
+      struct timespec now_ts;
+      double dt, want;
+      int n, nmax = audio_samplerate / 8;
+      clock_gettime(CLOCK_MONOTONIC, &now_ts);
+      if (last_ts.tv_sec == 0 && last_ts.tv_nsec == 0)
+         dt = 1.0 / framerate;
+      else
+         dt = (now_ts.tv_sec - last_ts.tv_sec) + (now_ts.tv_nsec - last_ts.tv_nsec) * 1e-9;
+      last_ts = now_ts;
+      want = dt * audio_samplerate + carry;
+      n = (int)want;
+      carry = want - n;
+      if (n > nmax)      { n = nmax; carry = 0; }
+      else if (n < 64)   { carry += n; n = 64; carry -= 64; if (carry < -64) carry = 0; }
+      if (n > AUDIO_BUFFER_SIZE / 2) n = AUDIO_BUFFER_SIZE / 2;
+      if (shm)
+         shm->samples_per_frame = n;
+   }
+
    BGM_Update();
    if (cls.state == ca_active)
       S_Update(r_origin, vpn, vright, vup);
@@ -1947,7 +2095,8 @@ static void audio_step(void)
     * advance only by what was actually consumed --
     * the unwritten tail will be retried in the next
     * loop iteration. */
-   audio_frames_remaining = audio_samplerate / framerate;
+   audio_frames_remaining = shm ? (unsigned)shm->samples_per_frame : audio_samplerate / framerate;
+   fstats.audio += audio_frames_remaining;
 
    /* Float output path: push the engine's normalized-float buffer through the
     * negotiated float batch callback.  Identical chunking / partial-write

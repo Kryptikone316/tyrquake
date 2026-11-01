@@ -21,6 +21,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "compat/strl.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "client.h"
 #include "cmd.h"
@@ -336,6 +342,95 @@ Con_Printf
 Handles cursor positioning, line wrapping, etc
 ================
 */
+/* SF3500 diagnostics.  Everything the engine prints, and the Dbg_Log() lines (stats,
+ * music, repairs), go into a 64 KB in-memory ring that costs nothing on the card.
+ *   - The ring is written to /mnt/sdcard/tyrquake_crash.log when something goes wrong:
+ *     Host_Error, Sys_Error, a repaired string reference, or a fatal signal.
+ *   - If the file /mnt/sdcard/tyrquake_debug.txt exists, every line is also streamed to
+ *     /mnt/sdcard/tyrquake.log as it happens (TYR_LOG overrides the path, for tests). */
+#define DBG_RING_SIZE (64 * 1024)
+static char dbg_ring[DBG_RING_SIZE];
+static unsigned dbg_head;        /* total bytes ever written */
+static FILE *dbg_stream;
+static int dbg_stream_tried;
+
+static void dbg_ring_put(const char *p, size_t n)
+{
+   while (n--)
+      dbg_ring[dbg_head++ % DBG_RING_SIZE] = *p++;
+}
+
+void Dbg_Log(const char *fmt, ...)
+{
+   char line[512];
+   int n;
+   va_list ap;
+   va_start(ap, fmt);
+   n = vsnprintf(line, sizeof(line) - 1, fmt, ap);
+   va_end(ap);
+   if (n < 0)
+      return;
+   if (n > (int)sizeof(line) - 2)
+      n = sizeof(line) - 2;
+   line[n++] = '\n';
+   dbg_ring_put(line, n);
+   if (!dbg_stream_tried)
+   {
+      const char *path = getenv("TYR_LOG");
+      dbg_stream_tried = 1;
+      if (path || access("/mnt/sdcard/tyrquake_debug.txt", F_OK) == 0)
+         dbg_stream = fopen(path ? path : "/mnt/sdcard/tyrquake.log", "w");
+   }
+   if (dbg_stream)
+   {
+      fwrite(line, 1, n, dbg_stream);
+      fflush(dbg_stream);
+   }
+}
+
+/* Write the ring, oldest line first, to the crash log.  Safe enough to call from a
+ * signal handler: only open/write/close on a static buffer. */
+void Dbg_DumpCrashLog(const char *why)
+{
+   static int dumping;
+   int fd;
+   unsigned start, len;
+   if (dumping)
+      return;
+   dumping = 1;
+   fd = open("/mnt/sdcard/tyrquake_crash.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   if (fd >= 0)
+   {
+      if (write(fd, "reason: ", 8) < 0) {}
+      if (write(fd, why, strlen(why)) < 0) {}
+      if (write(fd, "\n", 1) < 0) {}
+      len = dbg_head < DBG_RING_SIZE ? dbg_head : DBG_RING_SIZE;
+      start = dbg_head < DBG_RING_SIZE ? 0 : dbg_head % DBG_RING_SIZE;
+      if (write(fd, dbg_ring + start, len - start) < 0) {}
+      if (start && write(fd, dbg_ring, start) < 0) {}
+      close(fd);
+   }
+   dumping = 0;
+}
+
+static void dbg_signal(int sig)
+{
+   char why[32];
+   snprintf(why, sizeof(why), "fatal signal %d", sig);
+   Dbg_DumpCrashLog(why);
+   signal(sig, SIG_DFL);
+   raise(sig);
+}
+
+void Dbg_InstallCrashHandlers(void)
+{
+   signal(SIGSEGV, dbg_signal);
+   signal(SIGBUS, dbg_signal);
+   signal(SIGILL, dbg_signal);
+   signal(SIGFPE, dbg_signal);
+   signal(SIGABRT, dbg_signal);
+}
+
 void Con_Printf(const char *fmt, ...)
 {
    va_list argptr;
@@ -347,6 +442,12 @@ void Con_Printf(const char *fmt, ...)
 
    /* also echo to debugging console */
    Sys_Printf("%s", msg);	/* also echo to debugging console */
+   {
+      char *nl = strchr(msg, 0);
+      if (nl > msg && nl[-1] == '\n') nl[-1] = 0;
+      Dbg_Log("con: %s", msg);
+      if (nl > msg && !nl[-1]) nl[-1] = '\n';
+   }
 
    if (!con_initialized)
       return;
